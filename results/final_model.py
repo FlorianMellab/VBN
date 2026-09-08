@@ -1359,7 +1359,7 @@ def init_tracking_mode(current_file, ellipse_path_dataset, pose_path_dataset, fx
 #DEV
 # if __name__ == "__main__":
 #     if cfg["camera"] == "camera_X":
-#         # Camera parameters - ClearSpace
+#         # Camera parameters - CamX
 #         focal_length = 6e-3  # m
 #         pixel_pitch = 2.2e-6 # m
 #         image_size = [2590, 1942]
@@ -1640,7 +1640,7 @@ def init_tracking_mode(current_file, ellipse_path_dataset, pose_path_dataset, fx
 #FULL DATASET
 if __name__ == "__main__":
     if cfg["camera"] == "camera_X":
-        # Camera parameters - ClearSpace
+        # Camera parameters - CamX
         focal_length = 6e-3  # m
         pixel_pitch = 2.2e-6 # m
         image_size = [2590, 1942]
