@@ -6,10 +6,9 @@ from pathlib import Path
 R_OUTER = 0.080   # 80mm
 R_INNER = 0.066   # 66mm
 
-# Known physical radii (metres) - EUTELSAT 16A (DOR CAD)
-#Shall be confirmed
+# Known physical radii (metres) - EUTELSAT (DOR CAD)
 # R_OUTER = 0.597   # 597mm
-# R_INNER = 0.553   # 550mm (Only an estimation....)
+# R_INNER = 0.553   # 550mm 
 
 def inliers_to_circle_correspondence(
     inliers, xc, yc, a, b, theta, radius
