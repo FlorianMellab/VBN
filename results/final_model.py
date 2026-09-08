@@ -83,16 +83,9 @@ sma_ratio_nominal = cfg["R_INNER"] / cfg["R_OUTER"]
 # R_OUTER = 0.080   # 80mm
 # R_INNER = 0.066   # 66mm
 
-# Known physical radii (metres) - EUTELSAT 16A (DOR CAD)
-#Shall be confirmed
+# Known physical radii (metres) - EUTELSAT (DOR CAD)
 # R_OUTER = 0.597   # 597mm
-# R_INNER = 0.553   # 553mm (Only an estimation....)
-
-#TO DO:
-#Make edge detection dependent on average brightness
-
-#Changes made:
-#Changes made to ROI definition: search area now defined by centroid of max density area.
+# R_INNER = 0.553   # 553mm 
 
 #####
 #Helper functions
@@ -138,106 +131,10 @@ def find_contours(seg):
     )
     return contours
 
-def find_edges_structured_forests(img, model_path, low_thresh_relative=0.1):
-    """
-    Edge detection using OpenCV's Structured Forests learned edge detector,
-    as an alternative to Canny. Unlike Canny, this model was trained to
-    recognise locally-consistent edge *patterns* (via random-forest
-    classification on patch features) rather than purely thresholding
-    gradient magnitude, so it tends to produce edges that are less
-    fragmented under varying local contrast and doesn't need a hand-tuned
-    low/high threshold pair the way Canny does.
-
-    Caveat: the bundled model (model.yml.gz) was trained on BSDS500, a
-    natural-image dataset (outdoor photos). Its behaviour on satellite/
-    space imagery, with very different brightness distributions and noise
-    characteristics, is unverified — this should be A/B tested against
-    Canny on real frames before being trusted as a replacement.
-
-    Input:
-        img:                  grayscale image array (H x W), uint8 or
-                              uint16 (will be normalised to float32 [0,1]
-                              and replicated to 3 channels, since the
-                              model expects a BGR-like 3-channel input).
-        model_path:           path to the downloaded model.yml.gz file.
-        low_thresh_relative:  the model outputs a continuous edge-strength
-                              map in [0, 1], not a binary edge map. This
-                              fraction of the max edge strength is used as
-                              a threshold to binarise it into a 0/255 map
-                              compatible with the rest of the pipeline
-                              (cv.findContours, thinning, etc).
-
-    Output:
-        edges:                binary edge map (H x W, uint8, values 0/255),
-                              same format as find_edges' output.
-    """
-    # Normalise to float32 in [0, 1], as required by detectEdges
-    if img.max() > 255:
-        img_norm = (img.astype(np.float32) / 4095.0)  # 12-bit range
-    else:
-        img_norm = (img.astype(np.float32) / 255.0)
-
-    # Model expects a 3-channel (BGR-like) image
-    img_3ch = cv.cvtColor(img_norm, cv.COLOR_GRAY2BGR)
-
-    edge_detector = cv.ximgproc.createStructuredEdgeDetection(model_path)
-    edge_strength = edge_detector.detectEdges(img_3ch)  # float32, values in [0,1]
-
-    # Binarise the continuous edge-strength map
-    threshold = low_thresh_relative * edge_strength.max()
-    edges = (edge_strength > threshold).astype(np.uint8) * 255
-
-    return edges
-
 
 #####
 #Filtering
 #####
-# def refine_search_area(edges, kernel_size, density_threshold, margin):
-#     """
-#     Find the largest high-density edge region and return a cropped edge map.
-
-#     Input:
-#         edges:             Canny edge map (H x W, uint8)
-#         kernel_size:       size of the box filter used to estimate local edge density
-#                            (odd number; larger = smoother density estimate)
-#         density_threshold: fraction of edge pixels in a local neighbourhood to be
-#                            considered a dense region (tune with the density heatmap)
-#         margin:            extra pixels added around the detected region's bounding box
-
-#     Output:
-#         cropped_edges:     edge map sliced to the bounding box of the largest dense region
-#         (x1, y1, x2, y2): bounding box in original image coordinates
-#     """
-#     h, w = edges.shape
-
-#     # Pixel-level local density: mean of edge pixels in a (kernel_size x kernel_size) window
-#     edge_float = (edges > 0).astype(np.float32)
-#     density_map = cv.boxFilter(edge_float, ddepth=-1, ksize=(kernel_size, kernel_size),
-#                                 normalize=True)
-
-#     # Threshold to get a binary dense-region mask
-#     dense_mask = (density_map > density_threshold).astype(np.uint8)
-
-#     if not np.any(dense_mask):
-#         print("Warning: no dense region found, returning full edge map.")
-#         return edges, (0, 0, w, h)
-
-#     # Find connected components, pick the largest one
-#     n_labels, labels, stats, _ = cv.connectedComponentsWithStats(dense_mask)
-
-#     # stats columns: LEFT, TOP, WIDTH, HEIGHT, AREA  (label 0 is background)
-#     largest_label = 1 + np.argmax(stats[1:, cv.CC_STAT_AREA])
-
-#     x1 = max(0, stats[largest_label, cv.CC_STAT_LEFT] - margin)
-#     y1 = max(0, stats[largest_label, cv.CC_STAT_TOP] - margin)
-#     x2 = min(w, stats[largest_label, cv.CC_STAT_LEFT] + stats[largest_label, cv.CC_STAT_WIDTH]  + margin)
-#     y2 = min(h, stats[largest_label, cv.CC_STAT_TOP]  + stats[largest_label, cv.CC_STAT_HEIGHT] + margin)
-
-#     cropped_edges = edges[y1:y2, x1:x2]
-
-#     return cropped_edges, (x1, y1, x2, y2)
-
 def refine_search_area_symmetric(edges, kernel_size, density_threshold, expected_max_radius_px, margin):
     """
     Like refine_search_area, but forces a symmetric crop sized by known
