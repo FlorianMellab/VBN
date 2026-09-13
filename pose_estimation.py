@@ -3,14 +3,15 @@ import cv2 as cv
 from pathlib import Path
 
 # Known physical radii (metres)
-R_OUTER = 0.080   # 80mm
-R_INNER = 0.066   # 66mm
+R_OUTER = 0.080*7.4   # 80mm
+R_INNER = 0.066*7.4   # 66mm
 
-# Known physical radii (metres) - EUTELSAT (DOR CAD)
+# Known physical radii (metres) - EUTELSAT 16A (DOR CAD)
+#Shall be confirmed
 # R_OUTER = 0.597   # 597mm
-# R_INNER = 0.553   # 550mm 
+# R_INNER = 0.553   # 550mm (Only an estimation....)
 
-def inliers_to_circle_correspondence(
+def inliers_to_circle_correspondence_legacy(
     inliers, xc, yc, a, b, theta, radius
 ):
     """
@@ -57,6 +58,114 @@ def inliers_to_circle_correspondence(
     ], axis=1)
 
     return object_points.astype(np.float32), inliers.astype(np.float32)
+
+def ellipse_model_to_circle_correspondence(
+    xc,
+    yc,
+    a,
+    b,
+    theta,
+    radius,
+    n_points=360,
+    endpoint=False,
+):
+    """
+    Uniformly sample a complete fitted ellipse and associate each sampled
+    image point with a point on a physical circle of known radius.
+
+    This avoids biasing PnP toward whichever ellipse arc happened to be
+    visible or survived RANSAC.
+
+    Parameters
+    ----------
+    xc, yc : float
+        Ellipse centre in full-image coordinates.
+
+    a, b : float
+        Ellipse semi-axis lengths in pixels, using the same parameterization
+        as skimage.measure.EllipseModel.
+
+    theta : float
+        Ellipse orientation in radians.
+
+    radius : float
+        Physical circle radius in metres.
+
+    n_points : int
+        Number of uniformly distributed samples around the complete model.
+
+    endpoint : bool
+        Whether to repeat the zero-angle sample at 2*pi. This should normally
+        remain False because PnP does not need the duplicated point.
+
+    Returns
+    -------
+    object_points : ndarray, shape (N, 3), float32
+        Uniform physical-circle points in the local XY plane.
+
+    image_points : ndarray, shape (N, 2), float32
+        Uniform samples of the fitted image ellipse.
+    """
+    if n_points < 4:
+        raise ValueError(
+            "At least four model samples are required."
+        )
+
+    if a <= 0 or b <= 0:
+        raise ValueError(
+            f"Ellipse axes must be positive, received a={a}, b={b}."
+        )
+
+    if radius <= 0:
+        raise ValueError(
+            f"Circle radius must be positive, received {radius}."
+        )
+
+    phi = np.linspace(
+        0.0,
+        2.0 * np.pi,
+        n_points,
+        endpoint=endpoint,
+        dtype=np.float64,
+    )
+
+    cos_phi = np.cos(phi)
+    sin_phi = np.sin(phi)
+
+    cos_theta = np.cos(theta)
+    sin_theta = np.sin(theta)
+
+    # skimage EllipseModel parameterization:
+    #
+    # x = xc + a*cos(theta)*cos(phi) - b*sin(theta)*sin(phi)
+    # y = yc + a*sin(theta)*cos(phi) + b*cos(theta)*sin(phi)
+    image_x = (
+        xc
+        + a * cos_theta * cos_phi
+        - b * sin_theta * sin_phi
+    )
+
+    image_y = (
+        yc
+        + a * sin_theta * cos_phi
+        + b * cos_theta * sin_phi
+    )
+
+    image_points = np.column_stack([
+        image_x,
+        image_y,
+    ])
+
+    object_points = np.column_stack([
+        radius * cos_phi,
+        radius * sin_phi,
+        np.zeros_like(phi),
+    ])
+
+    return (
+        object_points.astype(np.float32),
+        image_points.astype(np.float32),
+    )
 
 def solve_pose(object_points, image_points, K):
     solutions = cv.solvePnPGeneric(
@@ -105,7 +214,7 @@ def rotation_to_rpy(R):
 
     return np.degrees([roll, pitch, yaw])
 
-def compute_pose(ellipse_data, K, R_OUTER, R_INNER):
+def compute_pose_legacy(ellipse_data, K, R_OUTER, R_INNER):
     """
     Compute pose for a single frame from its ellipse_data dict (the same
     structure the ellipse-detection pipeline saves to *_ellipses.npy).
@@ -141,11 +250,11 @@ def compute_pose(ellipse_data, K, R_OUTER, R_INNER):
     inliers_outer = outer["inliers"] + np.array([outer["x_offset"], outer["y_offset"]])
     inliers_inner = inner["inliers"] + np.array([inner["x_offset"], inner["y_offset"]])
 
-    obj_outer, img_outer = inliers_to_circle_correspondence(
+    obj_outer, img_outer = inliers_to_circle_correspondence_legacy(
         inliers_outer, outer_xc, outer_yc, outer["a"], outer["b"],
         np.radians(outer["theta_deg"]), R_OUTER
     )
-    obj_inner, img_inner = inliers_to_circle_correspondence(
+    obj_inner, img_inner = inliers_to_circle_correspondence_legacy(
         inliers_inner, inner_xc, inner_yc, inner["a"], inner["b"],
         np.radians(inner["theta_deg"]), R_INNER
     )
@@ -164,6 +273,200 @@ def compute_pose(ellipse_data, K, R_OUTER, R_INNER):
         "outer": {"tvec": tvec_o, "R": R_o, "reprojection_error": reproj_o},
         "inner": {"tvec": tvec_i, "R": R_i, "reprojection_error": reproj_i},
     }
+
+
+def compute_pose(
+    ellipse_data,
+    K,
+    R_OUTER,
+    R_INNER,
+    n_model_points=360
+):
+    """
+    Recover outer and inner LAR poses from uniformly sampled complete ellipse
+    models instead of from the potentially one-sided distribution of RANSAC
+    inliers.
+
+    This specifically removes the direct dependence of PnP on angular
+    coverage of the observed arc.
+
+    Parameters
+    ----------
+    ellipse_data : dict
+        Dictionary containing "outer" and "inner" ellipse models.
+
+    K : ndarray, shape (3, 3)
+        Camera intrinsic matrix.
+
+    R_OUTER, R_INNER : float
+        Physical outer and inner LAR radii in metres.
+
+    n_model_points : int
+        Number of uniform full-ellipse samples used for each PnP solve.
+
+    Returns
+    -------
+    pose_data : dict
+        Compatible outer/inner pose data
+    """
+    K = np.asarray(
+        K,
+        dtype=np.float64,
+    ).reshape(3, 3)
+
+    required_labels = [
+        "outer",
+        "inner",
+    ]
+
+    for label in required_labels:
+        if label not in ellipse_data:
+            raise KeyError(
+                f"ellipse_data is missing '{label}'. "
+                f"Available keys: {list(ellipse_data.keys())}"
+            )
+
+    outer = ellipse_data["outer"]
+    inner = ellipse_data["inner"]
+
+    required_fields = [
+        "xc",
+        "yc",
+        "a",
+        "b",
+        "theta_deg",
+        "x_offset",
+        "y_offset",
+    ]
+
+    for label, ellipse in [
+        ("outer", outer),
+        ("inner", inner),
+    ]:
+        missing = [
+            field
+            for field in required_fields
+            if field not in ellipse
+        ]
+
+        if missing:
+            raise KeyError(
+                f"{label} ellipse is missing fields: {missing}"
+            )
+
+    # Full-image ellipse centres.
+    outer_xc = (
+        float(outer["xc"])
+        + float(outer["x_offset"])
+    )
+
+    outer_yc = (
+        float(outer["yc"])
+        + float(outer["y_offset"])
+    )
+
+    inner_xc = (
+        float(inner["xc"])
+        + float(inner["x_offset"])
+    )
+
+    inner_yc = (
+        float(inner["yc"])
+        + float(inner["y_offset"])
+    )
+
+    # -------------------------------------------------------------------------
+    # Uniform complete-model sampling
+    # -------------------------------------------------------------------------
+    obj_outer, img_outer = (
+        ellipse_model_to_circle_correspondence(
+            xc=outer_xc,
+            yc=outer_yc,
+            a=float(outer["a"]),
+            b=float(outer["b"]),
+            theta=np.radians(
+                float(outer["theta_deg"])
+            ),
+            radius=float(R_OUTER),
+            n_points=n_model_points,
+            endpoint=False,
+        )
+    )
+
+    obj_inner, img_inner = (
+        ellipse_model_to_circle_correspondence(
+            xc=inner_xc,
+            yc=inner_yc,
+            a=float(inner["a"]),
+            b=float(inner["b"]),
+            theta=np.radians(
+                float(inner["theta_deg"])
+            ),
+            radius=float(R_INNER),
+            n_points=n_model_points,
+            endpoint=False,
+        )
+    )
+
+    # -------------------------------------------------------------------------
+    # Outer model pose
+    # -------------------------------------------------------------------------
+    (
+        rvec_outer,
+        tvec_outer,
+        R_outer,
+        reprojection_outer,
+    ) = solve_pose(
+        obj_outer,
+        img_outer,
+        K,
+    )
+
+    # -------------------------------------------------------------------------
+    # Inner model pose
+    # -------------------------------------------------------------------------
+    (
+        rvec_inner,
+        tvec_inner,
+        R_inner,
+        reprojection_inner,
+    ) = solve_pose(
+        obj_inner,
+        img_inner,
+        K,
+    )
+
+    return {
+        "outer": {
+            "rvec": rvec_outer,
+            "tvec": tvec_outer,
+            "R": R_outer,
+            "reprojection_error": float(
+                reprojection_outer
+            ),
+            "correspondence_source": (
+                "uniform_complete_ellipse_model"
+            ),
+            "n_model_points": int(
+                n_model_points
+            ),
+        },
+        "inner": {
+            "rvec": rvec_inner,
+            "tvec": tvec_inner,
+            "R": R_inner,
+            "reprojection_error": float(
+                reprojection_inner
+            ),
+            "correspondence_source": (
+                "uniform_complete_ellipse_model"
+            ),
+            "n_model_points": int(
+                n_model_points
+            ),
+        },
+    }
+
 
 if __name__ == "__main__":
     ClearSpace = False
@@ -196,8 +499,8 @@ if __name__ == "__main__":
     cy = image_size[1] / 2 
 
 
-    dataset_dir = Path(r"results\updated_model_06072026\CPO_dataset_2")
-    output_dir  = Path(r"results\updated_model_06072026\CPO_dataset_2_pose")
+    dataset_dir = Path(r"results\final_model_28082026\CPO_dataset_sensitivity_panels_rotated_scaled")
+    output_dir  = Path(r"results\final_model_28082026\CPO_dataset_sensitivity_panels_rotated_scaled_pose")
     output_dir.mkdir(exist_ok=True)
 
     data_extensions = {".npy"}
@@ -223,82 +526,12 @@ if __name__ == "__main__":
             allow_pickle=True
         ).item()  # .item() converts 0-d object array back to a Python dict
 
-        outer = ellipse_data["outer"]
-        inner = ellipse_data["inner"]
-
-        outer_xc = outer["xc"] + outer["x_offset"]
-        outer_yc = outer["yc"] + outer["y_offset"]
-
-        inner_xc = inner["xc"] + inner["x_offset"]
-        inner_yc = inner["yc"] + inner["y_offset"]
-
-        inliers_outer = outer["inliers"] + np.array([outer["x_offset"], outer["y_offset"]])
-        inliers_inner = inner["inliers"] + np.array([inner["x_offset"], inner["y_offset"]])
-
-        # Sample image points from both ellipses
-        obj_outer, img_outer = inliers_to_circle_correspondence(
-            inliers_outer,
-            outer_xc, outer_yc,
-            outer["a"], outer["b"],
-            np.radians(outer["theta_deg"]),
-            R_OUTER
+        pose_data = compute_pose(
+            ellipse_data,
+            K,
+            R_OUTER,
+            R_INNER,
+            n_model_points=360,
         )
-
-        obj_inner, img_inner = inliers_to_circle_correspondence(
-            inliers_inner,
-            inner_xc, inner_yc,
-            inner["a"], inner["b"],
-            np.radians(inner["theta_deg"]),
-            R_INNER
-        )
-
-        # Stack both rings — more points, better constrained
-        image_points  = np.vstack([img_outer, img_inner])
-        object_points = np.vstack([obj_outer, obj_inner])
-
-
-        #===============================
-        # Solve pose OUTER ONLY
-        # ===============================
-        rvec_o, tvec_o, R_o, err_o = solve_pose(obj_outer, img_outer, K)
-
-        proj_o, _ = cv.projectPoints(obj_outer, rvec_o, tvec_o, K, None)
-        proj_o = proj_o.squeeze()
-        reproj_o = np.linalg.norm(proj_o - img_outer, axis=1).mean()
-
-        # ===============================
-        # Solve pose INNER ONLY
-        # ===============================
-        rvec_i, tvec_i, R_i, err_i = solve_pose(obj_inner, img_inner, K)
-
-        proj_i, _ = cv.projectPoints(obj_inner, rvec_i, tvec_i, K, None)
-        proj_i = proj_i.squeeze()
-        reproj_i = np.linalg.norm(proj_i - img_inner, axis=1).mean()
-        
-        poses = [
-            ("outer", reproj_o, rvec_o, tvec_o, R_o),
-            ("inner", reproj_i, rvec_i, tvec_i, R_i),
-        ]
-
-        best_label, best_err, rvec_best, tvec_best, R_best = min(poses, key=lambda x: x[1])
-        
-        print("\n===== BEST POSE =====")
-        print(f"Selected: {best_label}")
-        print(f"Reprojection error: {best_err:.2f} px")
-        print(f"tvec: {tvec_best.ravel()}")
-        print(f"R:\n{R_best}")
-
-        pose_data = {
-            "outer": {
-                "tvec": tvec_o,
-                "R": R_o,
-                "reprojection_error": reproj_o
-            },
-            "inner": {
-                "tvec": tvec_i,
-                "R": R_i,
-                "reprojection_error": reproj_i
-            }
-        }
 
         np.save(output_dir / f"{stem}_pose.npy", pose_data)
